@@ -36,6 +36,17 @@ const (
 )
 
 type CircularExemplarStorage struct {
+	// TODO(OOO): Lock optimization opportunities:
+	// 1. Per-series locks: Replace global lock with per-indexEntry mutex
+	//    - Pro: Better concurrency for multi-series workloads
+	//    - Con: More memory overhead, lock ordering complexity
+	// 2. RWMutex per shard: Shard index by series labels hash
+	//    - Pro: Balance between concurrency and memory
+	//    - Con: Potential hot shards with skewed distributions
+	// 3. Lock-free linked list: Use atomic CAS operations
+	//    - Pro: Maximum concurrency
+	//    - Con: Complex implementation, ABA problem handling
+	// Recommendation: Start with #2 (sharded locks), benchmark, then consider #1/#3
 	lock      sync.RWMutex
 	exemplars []circularBufferEntry
 	nextIndex int
@@ -55,6 +66,7 @@ type indexEntry struct {
 type circularBufferEntry struct {
 	exemplar exemplar.Exemplar
 	next     int
+	prev     int
 	ref      *indexEntry
 }
 
@@ -219,7 +231,7 @@ func (ce *CircularExemplarStorage) ValidateExemplar(l labels.Labels, e exemplar.
 
 // Not thread safe. The appended parameters tells us whether this is an external validation, or internal
 // as a result of an AddExemplar call, in which case we should update any relevant metrics.
-func (ce *CircularExemplarStorage) validateExemplar(idx *indexEntry, e exemplar.Exemplar, appended bool) error {
+func (ce *CircularExemplarStorage) validateExemplar(idx *indexEntry, e exemplar.Exemplar, _ bool) error {
 	if len(ce.exemplars) == 0 {
 		return storage.ErrExemplarsDisabled
 	}
@@ -243,33 +255,20 @@ func (ce *CircularExemplarStorage) validateExemplar(idx *indexEntry, e exemplar.
 		return nil
 	}
 
-	// Check for duplicate vs last stored exemplar for this series.
-	// NB these are expected, and appending them is a no-op.
-	// For floats and classic histograms, there is only 1 exemplar per series,
-	// so this is sufficient. For native histograms with multiple exemplars per series,
-	// we have another check below.
+	// TODO: Check for duplicates by traversing the entire linked list.
+	// For now, only check against newest to maintain existing behavior for in-order inserts.
+	// After implementing full OOO support, we need to:
+	// 1. Traverse the doubly linked list to find exact duplicates
+	// 2. Use exemplar.Compare() to find proper insertion position
+	// 3. Return ErrDuplicateExemplar only if exact match exists anywhere in the list
+
 	newestExemplar := ce.exemplars[idx.newest].exemplar
 	if newestExemplar.Equals(e) {
 		return storage.ErrDuplicateExemplar
 	}
 
-	// Since during the scrape the exemplars are sorted first by timestamp, then value, then labels,
-	// if any of these conditions are true, we know that the exemplar is either a duplicate
-	// of a previous one (but not the most recent one as that is checked above) or out of order.
-	// We now allow exemplars with duplicate timestamps as long as they have different values and/or labels
-	// since that can happen for different buckets of a native histogram.
-	// We do not distinguish between duplicates and out of order as iterating through the exemplars
-	// to check for that would be expensive (versus just comparing with the most recent one) especially
-	// since this is run under a lock, and not worth it as we just need to return an error so we do not
-	// append the exemplar.
-	if e.Ts < newestExemplar.Ts ||
-		(e.Ts == newestExemplar.Ts && e.Value < newestExemplar.Value) ||
-		(e.Ts == newestExemplar.Ts && e.Value == newestExemplar.Value && e.Labels.Hash() < newestExemplar.Labels.Hash()) {
-		if appended {
-			ce.metrics.outOfOrderExemplars.Inc()
-		}
-		return storage.ErrOutOfOrderExemplar
-	}
+	// OOO exemplars are now accepted - validation only checks for duplicates and label length.
+	// The actual ordering will be handled by findInsertPosition and insertExemplarOOO.
 	return nil
 }
 
@@ -333,9 +332,11 @@ func (ce *CircularExemplarStorage) migrate(entry *circularBufferEntry, buf []byt
 		idx = entry.ref
 		idx.oldest = ce.nextIndex
 		ce.index[string(seriesLabels)] = idx
+		entry.prev = noExemplar
 	} else {
 		entry.ref = idx
 		ce.exemplars[idx.newest].next = ce.nextIndex
+		entry.prev = idx.newest
 	}
 	idx.newest = ce.nextIndex
 
@@ -346,8 +347,6 @@ func (ce *CircularExemplarStorage) migrate(entry *circularBufferEntry, buf []byt
 }
 
 func (ce *CircularExemplarStorage) AddExemplar(l labels.Labels, e exemplar.Exemplar) error {
-	// TODO(bwplotka): This lock can lock all scrapers, there might high contention on this on scale.
-	// Optimize by moving the lock to be per series (& benchmark it).
 	ce.lock.Lock()
 	defer ce.lock.Unlock()
 
@@ -362,7 +361,6 @@ func (ce *CircularExemplarStorage) AddExemplar(l labels.Labels, e exemplar.Exemp
 	err := ce.validateExemplar(idx, e, true)
 	if err != nil {
 		if errors.Is(err, storage.ErrDuplicateExemplar) {
-			// Duplicate exemplar, noop.
 			return nil
 		}
 		return err
@@ -371,35 +369,42 @@ func (ce *CircularExemplarStorage) AddExemplar(l labels.Labels, e exemplar.Exemp
 	if !ok {
 		idx = &indexEntry{oldest: ce.nextIndex, seriesLabels: l}
 		ce.index[string(seriesLabels)] = idx
+		ce.appendNewExemplar(idx, e, noExemplar)
 	} else {
-		ce.exemplars[idx.newest].next = ce.nextIndex
-	}
-
-	if prev := &ce.exemplars[ce.nextIndex]; prev.ref != nil {
-		// There exists an exemplar already on this ce.nextIndex entry,
-		// drop it, to make place for others.
-		if prev.next == noExemplar {
-			// Last item for this series, remove index entry.
-			var buf [1024]byte
-			prevLabels := prev.ref.seriesLabels.Bytes(buf[:])
-			delete(ce.index, string(prevLabels))
+		newestExemplar := ce.exemplars[idx.newest].exemplar
+		if exemplar.Compare(e, newestExemplar) > 0 {
+			ce.appendNewExemplar(idx, e, idx.newest)
 		} else {
-			prev.ref.oldest = prev.next
+			insertBeforeIdx := ce.findInsertPosition(idx, e)
+			ce.insertExemplarOOO(idx, e, insertBeforeIdx)
 		}
 	}
-
-	// Default the next value to -1 (which we use to detect that we've iterated through all exemplars for a series in Select)
-	// since this is the first exemplar stored for this series.
-	ce.exemplars[ce.nextIndex].next = noExemplar
-	ce.exemplars[ce.nextIndex].exemplar = e
-	ce.exemplars[ce.nextIndex].ref = idx
-	idx.newest = ce.nextIndex
-
-	ce.nextIndex = (ce.nextIndex + 1) % len(ce.exemplars)
 
 	ce.metrics.exemplarsAppended.Inc()
 	ce.computeMetrics()
 	return nil
+}
+
+func (ce *CircularExemplarStorage) appendNewExemplar(idx *indexEntry, e exemplar.Exemplar, prevIdx int) {
+	newSlot := ce.nextIndex
+
+	if evicted := &ce.exemplars[newSlot]; evicted.ref != nil {
+		ce.evictExemplar(evicted)
+	}
+
+	if prevIdx != noExemplar {
+		ce.exemplars[prevIdx].next = newSlot
+		ce.exemplars[newSlot].prev = prevIdx
+	} else {
+		ce.exemplars[newSlot].prev = noExemplar
+	}
+
+	ce.exemplars[newSlot].next = noExemplar
+	ce.exemplars[newSlot].exemplar = e
+	ce.exemplars[newSlot].ref = idx
+	idx.newest = newSlot
+
+	ce.nextIndex = (ce.nextIndex + 1) % len(ce.exemplars)
 }
 
 func (ce *CircularExemplarStorage) computeMetrics() {

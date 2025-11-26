@@ -66,7 +66,7 @@ func TestValidateExemplar(t *testing.T) {
 
 	e3.Ts = 1
 	e3.Value = 0.3
-	require.Equal(t, es.ValidateExemplar(l, e3), storage.ErrOutOfOrderExemplar)
+	require.NoError(t, es.ValidateExemplar(l, e3))
 
 	e4 := exemplar.Exemplar{
 		Labels: labels.FromStrings("a", strings.Repeat("b", exemplar.ExemplarMaxLabelSetLength)),
@@ -109,7 +109,7 @@ func TestAddExemplar(t *testing.T) {
 
 	e3.Ts = 1
 	e3.Value = 0.3
-	require.Equal(t, storage.ErrOutOfOrderExemplar, es.AddExemplar(l, e3))
+	require.NoError(t, es.AddExemplar(l, e3))
 
 	e4 := exemplar.Exemplar{
 		Labels: labels.FromStrings("a", strings.Repeat("b", exemplar.ExemplarMaxLabelSetLength)),
